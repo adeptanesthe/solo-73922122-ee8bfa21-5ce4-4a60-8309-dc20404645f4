@@ -65,6 +65,17 @@
   .uploader { border:1px dashed var(--line); border-radius:9px; padding:16px; text-align:center; }
   .uploader input { display:none; }
   .uploader label { color:var(--text); margin:0; cursor:pointer; }
+  button.tool-active { background:#0aa6c2; border-color:#00e5ff; color:#04121a; font-weight:700; }
+  .pf-levels { display:flex; flex-wrap:wrap; gap:3px; margin:8px 0 2px; }
+  .pf-chip { min-width:27px; text-align:center; font-size:11px; line-height:1.5;
+             border-radius:5px; border:1px solid var(--line); color:var(--muted);
+             background:#0d1322; padding:1px 3px; }
+  .pf-chip.ok { color:#06281a; background:var(--ok); border-color:var(--ok); font-weight:700; }
+  .pf-chip.bad { color:#3a0d12; background:rgba(255,93,108,.75); border-color:var(--bad); }
+  .pf-chip.peak { outline:2px solid #00e5ff; outline-offset:1px; }
+  .pf-mini { font-size:12px; color:var(--muted); margin:4px 0; line-height:1.5; }
+  .pf-mini b { color:var(--text); }
+  #overlay.pf-on { cursor:crosshair; }
 </style>
 </head>
 <body>
@@ -82,6 +93,7 @@
         <label for="file">点击选择灰度 PNG 上传</label>
       </div>
       <button class="primary" id="btnSample" style="width:100%;margin-top:9px;">载入内置样图（演示改色波及条带）</button>
+      <button id="btnPfDemo" style="width:100%;margin-top:7px;">载入反白细线预检演示图</button>
       <div id="imgInfo" class="muted" style="margin-top:8px;font-size:12px;"></div>
     </div>
 
@@ -113,13 +125,27 @@
     </div>
 
     <div class="card">
-      <h2>4. 输出</h2>
+      <h2>4. 反白细线预检（扩墨 0–16 档）</h2>
+      <button id="btnPfTool" style="width:100%;">📐 框选预检区域（宽高 ≤ 256）</button>
+      <div id="pfStep" class="pf-mini" style="margin-top:8px;">
+        未启用。点上方按钮后，在成稿上拖出预检框，再在框内依次点两个不同的成稿白点。
+      </div>
+      <div id="pfInfo" class="pf-mini"></div>
+      <div id="pfResult"></div>
+      <button id="btnPfRerun" style="width:100%;margin-top:6px;" disabled>用原框和端点重测</button>
+      <button id="btnPfClear" class="danger" style="width:100%;margin-top:6px;">清除预检框 / 端点 / 通道</button>
+    </div>
+
+    <div class="card">
+      <h2>5. 输出</h2>
       <button id="btnDownload" class="primary" style="width:100%;">下载当前稿黑白 PNG</button>
       <div class="legend" style="margin-top:8px;">
         <span><span class="swatch" style="background:var(--black-mark)"></span>强制黑</span>
         <span><span class="swatch" style="background:var(--white-mark)"></span>强制白</span>
         <span><span class="swatch" style="background:#00dc5a"></span>候选变色点</span>
         <span><span class="swatch" style="background:#ffaa00"></span>条带首个变色点</span>
+        <span><span class="swatch" style="background:#00e5ff"></span>预检框</span>
+        <span><span class="swatch" style="background:#19ff9c"></span>最高档最短通道</span>
       </div>
     </div>
   </aside>
@@ -151,6 +177,20 @@ let view = "out";
 let imgCache = {};
 let drag = null;
 
+// 反白预检的全部交互状态。box 为半开像素区间 {x0,y0,x1,y1}。
+// result 仅存放“已通过过期校验、当前正在展示”的响应；等待期间为 null，
+// 从而保证“等待时撤下旧结论（含通道线）”。
+let pf = {
+  active: false,
+  box: null,
+  eps: [],
+  result: null,
+  waiting: false,
+  error: null,
+  token: 0,
+};
+let outReader = null; // {sid, rid, w, h, data}
+
 function msg(kind, html) {
   const el = document.createElement("div");
   el.className = "msg " + kind;
@@ -174,8 +214,11 @@ async function loadImage(url) {
 }
 
 async function refresh(sess) {
+  const oldSid = state ? state.session_id : null;
   state = sess || (await api("/api/session/" + state.session_id));
   const sid = state.session_id;
+  if (oldSid && oldSid !== sid) resetPfAll();   // 换了图像/会话：预检状态全部归零
+  outReader = null;                             // 成稿像素读取缓存按 revision 失效
   $("imgInfo").innerHTML =
     `尺寸 <b>${state.width} × ${state.height}</b> · 会话 <code>${sid.slice(0,8)}</code>`;
   // 条带
@@ -265,15 +308,83 @@ function drawOverlay() {
       ctx.stroke();
     }
   }
-  // 拖拽矩形
+  // 反白预检：框、最高档通道、端点
+  drawPfOverlay(ctx);
+
+  // 拖拽矩形（强制色 = 黄色；预检框 = 青色，过大 = 红色）
   if (drag) {
-    ctx.strokeStyle = "#ffd23d";
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4, 3]);
-    const x = Math.min(drag.x0, drag.x1), y = Math.min(drag.y0, drag.y1);
-    ctx.strokeRect(x + 0.5, y + 0.5, Math.abs(drag.x1 - drag.x0), Math.abs(drag.y1 - drag.y0));
-    ctx.setLineDash([]);
+    if (drag.kind === "pf") {
+      const x0 = Math.min(drag.x0, drag.x1), y0 = Math.min(drag.y0, drag.y1);
+      const bw = Math.abs(drag.x1 - drag.x0) + 1, bh = Math.abs(drag.y1 - drag.y0) + 1;
+      const tooBig = bw > 256 || bh > 256;
+      ctx.fillStyle = tooBig ? "rgba(255,93,108,.10)" : "rgba(0,229,255,.08)";
+      ctx.fillRect(x0, y0, bw, bh);
+      ctx.strokeStyle = tooBig ? "#ff5d6c" : "#00e5ff";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([5, 3]);
+      ctx.strokeRect(x0 + 0.5, y0 + 0.5, bw - 1, bh - 1);
+      ctx.setLineDash([]);
+      ctx.fillStyle = tooBig ? "#ff8b96" : "#9ff3ff";
+      ctx.font = "12px sans-serif";
+      ctx.fillText(`${bw} × ${bh}${tooBig ? "  超过 256 上限" : ""}`, x0 + 4, y0 - 6 < 10 ? y0 + 14 : y0 - 6);
+    } else {
+      ctx.strokeStyle = "#ffd23d";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 3]);
+      const x = Math.min(drag.x0, drag.x1), y = Math.min(drag.y0, drag.y1);
+      ctx.strokeRect(x + 0.5, y + 0.5, Math.abs(drag.x1 - drag.x0), Math.abs(drag.y1 - drag.y0));
+      ctx.setLineDash([]);
+    }
   }
+}
+
+function drawPfOverlay(ctx) {
+  // 已确定的预检框
+  if (pf.box) {
+    const b = pf.box;
+    ctx.fillStyle = "rgba(0,229,255,.06)";
+    ctx.fillRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
+    ctx.strokeStyle = pf.active ? "#00e5ff" : "rgba(0,229,255,.75)";
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 3]);
+    ctx.strokeRect(b.x0 + 0.5, b.y0 + 0.5, b.x1 - b.x0 - 1, b.y1 - b.y0 - 1);
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#9ff3ff";
+    ctx.font = "12px sans-serif";
+    ctx.fillText(`预检框 ${b.x1 - b.x0}×${b.y1 - b.y0}`, b.x0 + 5, b.y0 + 15);
+  }
+
+  // 最高档最短通道（等待/零档断时 result 为 null 或 path 为空 → 不画线）
+  const path = pf.result && Array.isArray(pf.result.path) ? pf.result.path : [];
+  if (!pf.waiting && path.length >= 2) {
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    path.forEach(([x, y], i) => {
+      if (i === 0) ctx.moveTo(x + 0.5, y + 0.5);
+      else ctx.lineTo(x + 0.5, y + 0.5);
+    });
+    ctx.strokeStyle = "rgba(0,0,0,.65)";
+    ctx.lineWidth = 4;
+    ctx.stroke();
+    ctx.strokeStyle = "#19ff9c";
+    ctx.lineWidth = 1.8;
+    ctx.stroke();
+  }
+
+  // 端点 A / B
+  pf.eps.forEach((p, i) => {
+    ctx.beginPath();
+    ctx.arc(p.x + 0.5, p.y + 0.5, 3.4, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+    ctx.lineWidth = 1.6;
+    ctx.strokeStyle = i === 0 ? "#1d6cff" : "#e0245e";
+    ctx.stroke();
+    ctx.fillStyle = i === 0 ? "#1d6cff" : "#e0245e";
+    ctx.font = "bold 11px sans-serif";
+    ctx.fillText(i === 0 ? "A" : "B", p.x + 5, p.y - 5);
+  });
 }
 
 function eventPos(e) {
@@ -288,47 +399,71 @@ function eventPos(e) {
 $("overlay").addEventListener("mousedown", (e) => {
   if (!state) return;
   const p = eventPos(e);
-  drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+  if (pf.active) {
+    drag = { kind: "pf", x0: p.x, y0: p.y, x1: p.x, y1: p.y, cx: e.clientX, cy: e.clientY };
+  } else {
+    drag = { kind: "force", x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+  }
 });
 window.addEventListener("mousemove", (e) => {
   if (!drag) return;
   const p = eventPos(e);
   drag.x1 = p.x; drag.y1 = p.y;
-  $("rectInfo").textContent =
-    `框选：x ${Math.min(drag.x0, drag.x1)}–${Math.max(drag.x0, drag.x1)}，` +
-    `y ${Math.min(drag.y0, drag.y1)}–${Math.max(drag.y0, drag.y1)}（0基像素）`;
+  if (drag.kind === "force") {
+    $("rectInfo").textContent =
+      `框选：x ${Math.min(drag.x0, drag.x1)}–${Math.max(drag.x0, drag.x1)}，` +
+      `y ${Math.min(drag.y0, drag.y1)}–${Math.max(drag.y0, drag.y1)}（0基像素）`;
+  }
   drawOverlay();
 });
-window.addEventListener("mouseup", async () => {
+window.addEventListener("mouseup", async (e) => {
   if (!drag) return;
   const d = drag; drag = null;
+  if (d.kind === "pf") { await handlePfMouseUp(e, d); return; }
   if (Math.abs(d.x1 - d.x0) < 1 && Math.abs(d.y1 - d.y0) < 1) { drawOverlay(); return; }
   const mode = document.querySelector("input[name=mode]:checked").value;
+  // 若当前已有完整预检，换稿一旦被接受就要按原框/端点重测：
+  // 先撤下旧结论，避免 refresh 重绘时残留旧通道线。
+  const hadCompletePf = !!(pf.box && pf.eps.length === 2);
   try {
     const data = await api(`/api/session/${state.session_id}/force`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ x0: d.x0, y0: d.y0, x1: d.x1 + 1, y1: d.y1 + 1, mode }),
     });
+    // 请求往返期间用户可能已清除/改动预检：仅在仍是同一组完整条件时撤旧结论
+    if (data.result.accepted && hadCompletePf && pf.box && pf.eps.length === 2) {
+      withdrawPfConclusion();
+    }
     await refresh(data.session);
     const r = data.result;
     if (r.accepted) {
       msg("ok", `✅ 新稿已接受：续算起点第 <b>${r.resume_start}</b> 行（0基），` +
-        `改动行 ${r.changed_rows.join(", ")}，所有已打样条带均未变色。`);
+        `改动行 ${r.changed_rows.join(", ")}，所有已打样条带均未变色。` +
+        (hadCompletePf ? "<br/>预检框与端点保持不变，正在按新稿重测…" : ""));
       view = "out";
+      syncTabs();
     } else if (r.violations && r.violations.length) {
       msg("bad", "⛔ 换稿被拒绝：已打样条带内出现网点变色，<b>旧稿及其强制色已保留</b>。<br/>" +
         r.violations.map(v =>
           `· ${v.label}（行 ${v.top + 1}–${v.bottom}）首个变色点：` +
           `第 ${v.first_point[0] + 1} 行 第 ${v.first_point[1] + 1} 列`).join("<br/>") +
-        `<br/>可切换到「被拒候选稿」页签查看绿色变色区域与橙色标记。`);
+        `<br/>可切换到「被拒候选稿」页签查看绿色变色区域与橙色标记。` +
+        (hadCompletePf && pf.result ? "<br/><b>当前预检结论沿用不变。</b>" : ""));
       view = "pending";
+      syncTabs();
     } else {
       msg("info", r.note || "强制色无实际变化。");
     }
     await drawView();
-  } catch (e) { msg("bad", e.message); }
+    if (r.accepted && pf.box && pf.eps.length === 2) runPreflight();
+  } catch (err) { msg("bad", err.message); }
 });
+
+function syncTabs() {
+  document.querySelectorAll(".tabs button").forEach(b =>
+    b.classList.toggle("active", b.dataset.view === view));
+}
 
 document.querySelectorAll(".tabs button").forEach(btn => {
   btn.addEventListener("click", () => {
@@ -338,6 +473,250 @@ document.querySelectorAll(".tabs button").forEach(btn => {
     drawView();
   });
 });
+
+// ================================================================ 反白预检
+function resetPfAll() {
+  // 会话切换时清空框/端点/结论与在途请求，但保留预检工具开关，
+  // 避免 refresh 的 await 期间极快的按下被误判成强制色拖框。
+  pf.box = null;
+  pf.eps = [];
+  pf.result = null;
+  pf.waiting = false;
+  pf.error = null;
+  pf.token++;
+  outReader = null;
+  updatePfToolButton();
+  renderPfPanel();
+}
+
+function withdrawPfConclusion() {
+  // 换稿成功、即将按原条件重测：立刻撤下旧结论与通道线，进入等待态。
+  pf.result = null;
+  pf.error = null;
+  pf.waiting = true;
+  pf.token++;
+  renderPfPanel();
+  drawOverlay();
+}
+
+function updatePfToolButton() {
+  const btn = $("btnPfTool");
+  const ov = $("overlay");
+  if (!btn) return;
+  btn.textContent = pf.active
+    ? "⏹ 预检进行中：拖新框 / 点端点（点此回到强制色）"
+    : "📐 框选预检区域（宽高 ≤ 256）";
+  btn.classList.toggle("tool-active", pf.active);
+  ov.classList.toggle("pf-on", pf.active);
+}
+
+$("btnPfTool").addEventListener("click", () => {
+  if (!state) { msg("bad", "请先载入或上传图像。"); return; }
+  pf.active = !pf.active;
+  updatePfToolButton();
+  if (pf.active) {
+    msg("info", "预检模式：先在成稿上<b>拖出</b>宽高 ≤256 的检查框，再在框内<b>单击</b>两个不同的白点。" +
+      "再次点左侧按钮可回到强制色框选。");
+  }
+  renderPfPanel();
+});
+
+$("btnPfClear").addEventListener("click", () => {
+  pf.box = null; pf.eps = []; pf.result = null;
+  pf.waiting = false; pf.error = null; pf.token++;
+  renderPfPanel(); drawOverlay();
+});
+
+$("btnPfRerun").addEventListener("click", () => runPreflight());
+
+async function handlePfMouseUp(ev, d) {
+  const moved = Math.hypot(ev.clientX - d.cx, ev.clientY - d.cy);
+  const p = eventPos(ev);
+  if (moved < 5) { await pickEndpoint(p); return; }
+  // 拖框：按 inclusive 像素角点归一化为半开区间
+  const x0 = Math.min(d.x0, p.x), y0 = Math.min(d.y0, p.y);
+  const x1 = Math.max(d.x0, p.x) + 1, y1 = Math.max(d.y0, p.y) + 1;
+  const bw = x1 - x0, bh = y1 - y0;
+  if (bw > 256 || bh > 256) {
+    msg("bad", `预检框宽高各至多 256 像素，本次为 ${bw}×${bh}，请重新框选。`);
+    drawOverlay();
+    return;
+  }
+  pf.box = { x0, y0, x1, y1 };
+  pf.eps = []; pf.result = null; pf.error = null;
+  pf.waiting = false; pf.token++;
+  renderPfPanel(); drawOverlay();
+}
+
+async function getOutReader() {
+  const rid = state.current_revision_id;
+  if (outReader && outReader.sid === state.session_id && outReader.rid === rid) {
+    return outReader;
+  }
+  const bmp = await loadImage(
+    `/api/session/${state.session_id}/image/out?rid=${encodeURIComponent(rid)}`);
+  const c = document.createElement("canvas");
+  c.width = bmp.width; c.height = bmp.height;
+  const cx = c.getContext("2d", { willReadFrequently: true });
+  cx.drawImage(bmp, 0, 0);
+  const data = cx.getImageData(0, 0, c.width, c.height).data;
+  outReader = { sid: state.session_id, rid, w: c.width, h: c.height, data };
+  return outReader;
+}
+
+async function isWhitePixel(x, y) {
+  try {
+    const r = await getOutReader();
+    if (x < 0 || y < 0 || x >= r.w || y >= r.h) return false;
+    return r.data[(y * r.w + x) * 4] === 255;
+  } catch (e) {
+    return true; // 读回失败时不拦点击，由后端判定
+  }
+}
+
+async function pickEndpoint(p) {
+  if (!pf.box) {
+    msg("info", "请先在成稿上拖出预检框，再点端点。");
+    return;
+  }
+  const b = pf.box;
+  if (p.x < b.x0 || p.x >= b.x1 || p.y < b.y0 || p.y >= b.y1) {
+    msg("bad", `端点 (${p.x},${p.y}) 不在预检框 [${b.x0},${b.x1})×[${b.y0},${b.y1}) 内。`);
+    return;
+  }
+  if (!(await isWhitePixel(p.x, p.y))) {
+    msg("bad", `端点 (${p.x},${p.y}) 在当前成稿中不是白点，请点反白细线内的白点。`);
+    return;
+  }
+  if (pf.eps.some(q => q.x === p.x && q.y === p.y)) {
+    msg("bad", "两个端点必须是不同的像素，请重新点第二个端点。");
+    return;
+  }
+  if (pf.eps.length >= 2) pf.eps = [p];   // 已有点满两个：本次点击作为新的 A
+  else pf.eps.push(p);
+  pf.result = null; pf.error = null; pf.token++;
+  renderPfPanel(); drawOverlay();
+  if (pf.eps.length === 2) await runPreflight();
+}
+
+function sameSnap(a, b) {
+  return a.sid === b.sid &&
+    a.rid === b.rid &&
+    a.box.x0 === b.box.x0 && a.box.y0 === b.box.y0 &&
+    a.box.x1 === b.box.x1 && a.box.y1 === b.box.y1 &&
+    a.eps.length === b.eps.length &&
+    a.eps.every((p, i) => p.x === b.eps[i].x && p.y === b.eps[i].y);
+}
+
+async function runPreflight() {
+  if (!state || !pf.box || pf.eps.length !== 2) { renderPfPanel(); return; }
+  const snap = {
+    sid: state.session_id,
+    rid: state.current_revision_id,
+    box: { ...pf.box },
+    eps: pf.eps.map(p => ({ ...p })),
+  };
+  const token = ++pf.token;
+  pf.waiting = true; pf.result = null; pf.error = null;
+  renderPfPanel(); drawOverlay();
+  try {
+    const data = await api(`/api/session/${snap.sid}/preflight`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        x0: snap.box.x0, y0: snap.box.y0, x1: snap.box.x1, y1: snap.box.y1,
+        endpoints: snap.eps.map(p => [p.x, p.y]),
+      }),
+    });
+    // 过期响应保护：会话/成稿版本、框、端点必须仍与发起时完全一致
+    // （token 是补充手段，显式快照比对对应需求中的一致性条件）。
+    const current = {
+      sid: state ? state.session_id : null,
+      rid: state ? state.current_revision_id : null,
+      box: pf.box ? { ...pf.box } : null,
+      eps: pf.eps.map(p => ({ ...p })),
+    };
+    if (token !== pf.token || !pf.box || !sameSnap(snap, current) ||
+        data.revision_id !== snap.rid) {
+      return; // 已有更新的操作/换稿，本结果不得上屏
+    }
+    pf.waiting = false;
+    pf.result = data;
+    view = "out";
+    syncTabs();
+    renderPfPanel();
+    await drawView();
+  } catch (e) {
+    const current = {
+      sid: state ? state.session_id : null,
+      rid: state ? state.current_revision_id : null,
+      box: pf.box ? { ...pf.box } : null,
+      eps: pf.eps.map(p => ({ ...p })),
+    };
+    if (token !== pf.token || !pf.box || !sameSnap(snap, current)) return;
+    pf.waiting = false;
+    pf.error = e.message;
+    renderPfPanel();
+  }
+}
+
+function renderPfPanel() {
+  const step = $("pfStep"), info = $("pfInfo"), out = $("pfResult");
+  if (!step) return;
+  if (!pf.active && !pf.box) {
+    step.innerHTML = "未启用。点上方按钮后，在成稿上拖出预检框，再在框内依次点两个不同的成稿白点。";
+  } else if (pf.active && !pf.box) {
+    step.innerHTML = "① 在成稿上<b>按住拖出</b>宽高 ≤256 的检查框。";
+  } else if (pf.box && pf.eps.length === 0) {
+    step.innerHTML = "② 在框内<b>单击</b>第一个白点（将标记为 A）。";
+  } else if (pf.box && pf.eps.length === 1) {
+    step.innerHTML = "③ 再单击另一个不同的白点作为 B，随后自动试算 0–16 档。";
+  } else if (pf.waiting) {
+    step.innerHTML = "④ 正在试算并等待成稿一致性确认…";
+  } else {
+    step.innerHTML = "完成。可拖动新框、单击端点重选，或用原框/端点重测。";
+  }
+
+  if (pf.box) {
+    const b = pf.box;
+    info.innerHTML =
+      `框：(${b.x0},${b.y0})–(${b.x1 - 1},${b.y1 - 1})，` +
+      `<b>${b.x1 - b.x0}×${b.y1 - b.y0}</b> 像素<br/>` +
+      pf.eps.map((p, i) => `端点 ${i === 0 ? "A" : "B"}：<b>(${p.x},${p.y})</b>`).join("<br/>");
+  } else {
+    info.textContent = "";
+  }
+
+  $("btnPfRerun").disabled = !(pf.box && pf.eps.length === 2 && !pf.waiting);
+
+  if (pf.waiting) {
+    out.innerHTML = `<div class="msg info" style="margin:6px 0;">⏳ 正在按当前成稿试算 0–16 档，旧结论已撤下…</div>`;
+    return;
+  }
+  if (pf.error) {
+    out.innerHTML = `<div class="msg bad" style="margin:6px 0;">预检失败：${pf.error}</div>`;
+    return;
+  }
+  const r = pf.result;
+  if (!r) { out.innerHTML = ""; return; }
+
+  const chips = r.levels.map(l => {
+    const cls = l.connected ? "ok" : "bad";
+    const peak = (r.max_level === l.level) ? " peak" : "";
+    return `<span class="pf-chip ${cls}${peak}" title="${l.connected ? "连通，最短 " + l.shortest_length + " 边" : "断开"}">${l.level}</span>`;
+  }).join("");
+  if (r.max_level === null) {
+    out.innerHTML =
+      `<div class="msg bad" style="margin:6px 0;">⚠️ <b>零档已断</b>：${r.message}<br/>` +
+      `<span style="font-size:12px;">已撤下通道线；0–16 档状态（绿=通，红=断）：</span>` +
+      `<div class="pf-levels">${chips}</div></div>`;
+  } else {
+    out.innerHTML =
+      `<div class="msg ok" style="margin:6px 0;">✅ 仍有通道的最高扩墨档：<b>${r.max_level} 像素</b><br/>` +
+      `<span style="font-size:12px;">${r.message} 青色描边档位为最高档：</span>` +
+      `<div class="pf-levels">${chips}</div></div>`;
+  }
+}
 
 $("file").addEventListener("change", async (e) => {
   const f = e.target.files[0];
@@ -358,6 +737,25 @@ $("btnSample").addEventListener("click", async () => {
     msg("ok", "已载入样图。建议流程：先登记条带（如第 1–64 行），再在条带下方框选强制黑/白，" +
       "观察误差扩散如何波及条带并触发拒绝；在条带影响区之外改色则可正常换稿。");
     view = "out"; await drawView();
+  } catch (err) { msg("bad", err.message); }
+});
+
+$("btnPfDemo").addEventListener("click", async () => {
+  try {
+    const data = await api("/api/preflight-demo", { method: "POST" });
+    pf.active = true;                 // 载入后直接进入预检交互
+    await refresh(data);              // 新会话会 resetPfAll（其内部会把 active 置 false）
+    pf.active = true;
+    updatePfToolButton();
+    renderPfPanel();
+    view = "out";
+    syncTabs();
+    await drawView();
+    msg("info",
+      "预检演示图（纯黑白线稿）：① 框住上方 Z 形白线（约 x24–236、y48–96）；" +
+      "② 在上横段、下横段中央各点一个白点（如 (44,59)、(214,85)），应得最高档 <b>1</b> 并画出最短通道。" +
+      "随后关闭预检工具，在中间细颈上拖一个跨过白线的小强制黑框，换稿成功后会自动按原框/端点重测。" +
+      "下半区白线中间有断口，可另框选验证“零档已断”。");
   } catch (err) { msg("bad", err.message); }
 });
 

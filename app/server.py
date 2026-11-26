@@ -11,10 +11,14 @@ from flask import Flask, jsonify, request, send_file, send_from_directory, abort
 from PIL import Image
 
 from . import dither as D
+from . import preflight as PF
 from . import session as S
 
 MAX_SIDE = S.MAX_SIDE
 SAMPLE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "sample", "sample.png")
+PF_DEMO_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "sample", "preflight_demo.png"
+)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB 上传上限
@@ -112,6 +116,18 @@ def load_sample():
     if not os.path.exists(SAMPLE_PATH):
         abort(404, "样图不存在")
     with open(SAMPLE_PATH, "rb") as f:
+        gray = _load_gray_png(f)
+    sess = S.create_session(gray)
+    return jsonify(_session_payload(sess))
+
+
+@app.post("/api/preflight-demo")
+def load_preflight_demo():
+    """载入反白细线预检专用演示图（纯黑白线稿，256x256）。"""
+
+    if not os.path.exists(PF_DEMO_PATH):
+        abort(404, "预检演示图不存在")
+    with open(PF_DEMO_PATH, "rb") as f:
         gray = _load_gray_png(f)
     sess = S.create_session(gray)
     return jsonify(_session_payload(sess))
@@ -245,6 +261,37 @@ def apply_force(sid: str):
     return jsonify({"result": result, "session": _session_payload(sess)})
 
 
+# ---------------------------------------------------------------- 反白预检
+@app.post("/api/session/<sid>/preflight")
+def preflight_check(sid: str):
+    """反白细线扩墨预检。
+
+    请求 JSON：``{x0,y0,x1,y1, endpoints:[[x,y],[x,y]]}``，框为半开区间，
+    宽高各 ≤ 256。计算基于当前正式稿（被拒候选稿不影响预检）。
+    返回体额外带 ``revision_id``，供前端识别过期响应。
+    """
+
+    sess = S.get_session(sid)
+    data = request.get_json(force=True)
+    try:
+        x0 = int(data["x0"]); y0 = int(data["y0"])
+        x1 = int(data["x1"]); y1 = int(data["y1"])
+        endpoints = data["endpoints"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise S.ValidationError(f"参数缺失或非法：{exc}") from exc
+
+    # 正式稿的 out 数组入链后不再被改写（续算写在 copy 上），
+    # 故锁内取快照引用与 revision_id，锁外做 BFS 也安全。
+    with sess.lock:
+        rev = S.current_revision(sess)
+        out = rev.out
+        revision_id = rev.revision_id
+
+    result = PF.analyze(out, x0, y0, x1, y1, endpoints)
+    result["revision_id"] = revision_id
+    return jsonify(result)
+
+
 @app.post("/api/session/<sid>/strips")
 def add_strip(sid: str):
     sess = S.get_session(sid)
@@ -270,6 +317,11 @@ def delete_strip(sid: str, index: int):
 # ---------------------------------------------------------------- 错误处理
 @app.errorhandler(S.ValidationError)
 def _on_validation_error(err):
+    return jsonify({"error": str(err)}), 400
+
+
+@app.errorhandler(PF.PreflightError)
+def _on_preflight_error(err):
     return jsonify({"error": str(err)}), 400
 
 
